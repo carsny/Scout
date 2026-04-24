@@ -4,7 +4,15 @@
 // @version      0.6.0
 // @description  A smarter way to work tickets in AWS MyDay
 // @author       Carlee Snyder
-// @match        https://myday-website.cmh.aws-border.com/*
+// @include      http*://myday-website-*.aka.corp.amazon.com/ticket/*
+// @include      http*://myday-website-*.*.proxy.amazon.com/ticket/*
+// @include      http*://myday-website.*.aws-border.com/ticket/*
+// @include      http*://myday-website.*.aws-border.cn/ticket/*
+// @include      http*://myday-website-*.*.com/ticket/*
+// @include      http*://myday-website.us-iso-east-1.c2s.ic.gov/ticket/*
+// @include      http*://myday-website.us-isob-east-1.sc2s.sgov.gov/ticket/*
+// @include      http*://myday-website.ale.aws-border.hci.ic.gov/ticket/*
+// @include      http*://myday-website.ncl.aws-border.adc-e.uk/ticket/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_setClipboard
