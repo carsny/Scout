@@ -8,6 +8,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_setClipboard
+// @grant        GM_addStyle
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -1143,8 +1144,7 @@ Thanks for your time!</textarea>
   // STYLES
   // ────────────────────────────────────────────
   function injectStyles() {
-    const s = document.createElement('style');
-    s.textContent = `
+    const css = `
 
       /* ── Reach-out draft ── */
       .reach-out-draft {
@@ -1591,7 +1591,7 @@ Thanks for your time!</textarea>
       .scout-panel::-webkit-scrollbar-thumb { background: ${C.accentDim}; border-radius: 2px; }
 
     `;
-    document.head.appendChild(s);
+    GM_addStyle(css);
   }
 
   // ── Go ──
