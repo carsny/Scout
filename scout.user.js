@@ -1,0 +1,1604 @@
+// ==UserScript==
+// @name         Scout 🦊
+// @namespace    scout-overlay
+// @version      0.6.0
+// @description  A smarter way to work tickets in AWS MyDay
+// @author       Carlee Snyder
+// @match        https://myday-website.cmh.aws-border.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_setClipboard
+// @run-at       document-idle
+// ==/UserScript==
+
+// ─────────────────────────────────────────────
+// SCOUT v0.5 - Clean HUD, no external dependencies
+// Left panel: ticket info, previous repairs, failed test, quick links, trail map
+// Right panel: nudges, need a hand
+// Bottom bar: correspondence generator
+// ─────────────────────────────────────────────
+
+(function () {
+  'use strict';
+
+  const PANEL_W  = 175;   // px - left and right panel width
+  const PANEL_W_NARROW = 130; // px - narrower when repair history is open
+  const BOTTOM_H = 100;   // px - bottom bar height
+  const TOP_H    = 28;    // px - top status bar height (unused but kept for reference)
+
+  // ── Colors ──
+  const C = {
+    bg:        '#0d1117',
+    panel:     '#161b22',
+    accent:    '#39d0c8',
+    accentDim: '#1a6b67',
+    text:      '#e6edf3',
+    textDim:   '#8b949e',
+    warning:   '#f0a500',
+    success:   '#3fb950',
+    foxOrange: '#e8834a',
+    foxGlow:   '#3fb950',
+    cardBg:    '#1c2128',
+    nudgeBg:   '#1f2937',
+  };
+
+  // ── Prefs ──
+  const DEFAULTS = {};
+  function getPrefs() {
+    try {
+      const s = GM_getValue('scout_prefs', null);
+      return s ? Object.assign({}, DEFAULTS, JSON.parse(s)) : { ...DEFAULTS };
+    } catch (_) { return { ...DEFAULTS }; }
+  }
+  function savePrefs(p) { GM_setValue('scout_prefs', JSON.stringify(p)); }
+
+  let isOpen = false;
+  const prefs = getPrefs();
+
+  // ────────────────────────────────────────────
+  // INIT
+  // ────────────────────────────────────────────
+  function init() {
+    GM_setValue('scout_colors', '{}');
+    injectStyles();
+    createFoxButton();
+    createHUD();
+
+    // Always start with clean margins — prevents stale state from previous session
+    removeLayout();
+
+    startPageWatcher();
+
+    // Auto-mark Overview as visited since it's open on ticket load
+    setTimeout(() => {
+      visitedTabs.add('Overview');
+      readTrailMap();
+      logStep('📋 opened ticket');
+    }, 2000);
+
+    // Add keyboard shortcut: Ctrl+Shift+S to toggle Scout
+    document.addEventListener('keydown', (e) => {
+      if (e.ctrlKey && e.shiftKey && e.key === 'S') {
+        e.preventDefault();
+        toggleHUD();
+      }
+    });
+    console.log('[Scout] 🦊 awake. Press Ctrl+Shift+S to toggle.');
+  }
+
+  // ────────────────────────────────────────────
+  // FOX BUTTON
+  // ────────────────────────────────────────────
+  function createFoxButton() {
+    const btn = document.createElement('div');
+    btn.id = 'scout-fox-btn';
+    btn.innerHTML = `<span class="fox-emoji">🦊</span>`;
+    btn.addEventListener('click', toggleHUD);
+    document.body.appendChild(btn);
+  }
+
+  function updateFoxVisibility() {
+    const btn = document.getElementById('scout-fox-btn');
+    if (!btn) return;
+    const onTicket = isTicketPage();
+    // Fox button always visible — but close Scout if we navigated off a ticket
+    if (!onTicket && isOpen) {
+      isOpen = false;
+      GM_setValue('scout_is_open', false);
+      const hud = document.getElementById('scout-hud');
+      if (hud) hud.classList.remove('scout-hud--open');
+      try { removeLayout(); } catch(e) {}
+    }
+  }
+
+  // ────────────────────────────────────────────
+  // HUD  (injected into page flow via body padding)
+  // ────────────────────────────────────────────
+  function createHUD() {
+    const hud = document.createElement('div');
+    hud.id = 'scout-hud';
+
+    hud.innerHTML = `
+
+      <!-- Top status bar removed per Carlee's preference -->
+
+      <!-- Left panel -->
+      <div id="scout-left" class="scout-panel">
+        <div class="panel-header">🦊 The Full Picture</div>
+
+        <div class="scout-card">
+          <div class="card-label">TICKET</div>
+          <div class="card-value" id="val-ticket-id">—</div>
+          <div class="card-sub"  id="val-ticket-sub">reading ticket...</div>
+        </div>
+
+        <div class="scout-card scout-card--warning" id="card-history" style="display:none">
+          <div class="card-label">⚠ HOST HAS HISTORY</div>
+          <div class="card-value" id="val-history">—</div>
+        </div>
+
+        <div class="scout-card">
+          <div class="card-label">PREVIOUS REPAIRS</div>
+          <div class="card-value" id="val-already-done"><em class="dim">open the Repair History tab</em></div>
+        </div>
+
+        <div class="scout-card">
+          <div class="card-label">QUICK LINKS</div>
+          <div class="card-value" id="val-quick-links"><em class="dim">Scout will surface links as it reads the ticket</em></div>
+        </div>
+
+        <div class="scout-card">
+          <div class="card-label">FAILED TEST</div>
+          <div class="card-value" id="val-failed-test"><em class="dim">Scout will surface test failures as it reads the ticket</em></div>
+        </div>
+
+        <div class="panel-header" style="margin-top:8px">🗺 Trail Map</div>
+
+        <div class="scout-card">
+          <div class="card-label">SCOUT HAS SEEN SO FAR</div>
+          <div class="trail-section-label">Where you have been:</div>
+          <div id="trail-visited"><em class="dim">nothing yet — start clicking around</em></div>
+          <div class="trail-section-label" style="margin-top:6px">Where Scout suggests going:</div>
+          <div id="trail-suggested"><em class="dim">Scout will build this as it reads the ticket</em></div>
+        </div>
+      </div>
+
+      <!-- Right panel -->
+      <div id="scout-right" class="scout-panel">
+        <div class="panel-header">✦ Right Now</div>
+
+        <div class="panel-header" style="margin-top:8px">✦ What Could I Try?</div>
+
+        <div id="nudge-list">
+          <div class="nudge-card">
+            <div class="nudge-text">Scout will surface gentle nudges here as you work through the ticket.</div>
+          </div>
+        </div>
+
+        <div class="panel-header" style="margin-top:8px">(｡•́︿•̀｡) Need a Hand?</div>
+
+        <div class="scout-card">
+          <div style="font-size:11px; color:${C.textDim}; margin-bottom:6px">Stuck or need to loop someone in?</div>
+          <button class="scout-reach-btn" id="btn-draft-reachout">✉ Draft a reach-out</button>
+          <div id="val-need-a-hand" style="margin-top:6px"></div>
+        </div>
+      </div>
+
+      <!-- Bottom bar -->
+      <div id="scout-bottom">
+        <div id="scout-bottom-left">
+          <div class="bottom-title">
+            <button id="btn-collapse-bottom" class="scout-collapse-btn" title="Collapse">▼</button>
+            ✦ Correspondence Summary Generator
+          </div>
+          <div id="scout-corr-body">
+            <div id="scout-corr-cols">
+              <div class="corr-col">
+                <div class="corr-col-title">"What I Did" — Ready to paste</div>
+                <div class="corr-col-body" id="corr-what-i-did"><em class="dim">Scout will draft this as you work</em></div>
+              </div>
+              <div class="corr-col">
+                <div class="corr-col-title">"Already Done" — For next tech</div>
+                <div class="corr-col-body" id="corr-already-done"><em class="dim">Scout will draft this from ticket history</em></div>
+              </div>
+            </div>
+            <div id="scout-corr-btns">
+              <button class="scout-copy-btn" id="btn-copy-whatidid">📋 Copy "What I Did"</button>
+              <button class="scout-copy-btn" id="btn-copy-handoff">📋 Copy "Already Done"</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    `;
+
+    document.body.appendChild(hud);
+
+    // ── Wire up all button events via addEventListener (CSP-safe) ──
+    document.getElementById('btn-copy-whatidid')?.addEventListener('click', () => scoutCopy('corr-what-i-did'));
+    document.getElementById('btn-copy-handoff') ?.addEventListener('click', () => scoutCopy('corr-already-done'));
+    document.getElementById('btn-draft-reachout')?.addEventListener('click', () => scoutDraftReachOut());
+
+    // ── Bottom bar collapse toggle ──
+    let bottomCollapsed = GM_getValue('scout_bottom_collapsed', false) === true;
+    function applyBottomState() {
+      const body = document.getElementById('scout-corr-body');
+      const btn  = document.getElementById('btn-collapse-bottom');
+      const bar  = document.getElementById('scout-bottom');
+      const leftPanel  = document.getElementById('scout-left');
+      const rightPanel = document.getElementById('scout-right');
+      const foxBtn     = document.getElementById('scout-fox-btn');
+      if (!body || !btn || !bar) return;
+      if (bottomCollapsed) {
+        body.style.display = 'none';
+        bar.style.height   = '28px';
+        btn.textContent    = '▲';
+        btn.title          = 'Expand';
+        if (leftPanel)  leftPanel.style.bottom  = '28px';
+        if (rightPanel) rightPanel.style.bottom = '28px';
+        if (isOpen) {
+          const root = getAppRoot();
+          root.style.marginBottom = '28px';
+        }
+      } else {
+        body.style.display = '';
+        bar.style.height   = BOTTOM_H + 'px';
+        btn.textContent    = '▼';
+        btn.title          = 'Collapse';
+        if (leftPanel)  leftPanel.style.bottom  = BOTTOM_H + 'px';
+        if (rightPanel) rightPanel.style.bottom = BOTTOM_H + 'px';
+        if (isOpen) {
+          const root = getAppRoot();
+          root.style.marginBottom = BOTTOM_H + 'px';
+        }
+      }
+    }
+    document.getElementById('btn-collapse-bottom')?.addEventListener('click', () => {
+      bottomCollapsed = !bottomCollapsed;
+      GM_setValue('scout_bottom_collapsed', bottomCollapsed === true);
+      applyBottomState();
+    });
+    // Restore collapsed state on load
+    applyBottomState();
+
+    // Event delegation for dynamically created buttons (nudges)
+    hud.addEventListener('click', (e) => {
+      const t = e.target;
+      if (!t.matches('button')) return;
+
+      // Nudge reactions
+      const nudgeCard = t.closest('[data-nudge-id]');
+      if (nudgeCard) {
+        const id = nudgeCard.dataset.nudgeId;
+        const helpful = t.classList.contains('nudge-btn--yes');
+        scoutNudgeReact(id, helpful);
+        return;
+      }
+    });
+  }
+
+  // ────────────────────────────────────────────
+  // TOGGLE — shifts MyDay's content using margins
+  // on the root app element rather than body padding,
+  // which prevents reflow/zoom on tab navigation
+  // ────────────────────────────────────────────
+  function toggleHUD() {
+    isOpen = !isOpen;
+
+    const hud  = document.getElementById('scout-hud');
+    const btn  = document.getElementById('scout-fox-btn');
+
+    if (isOpen) {
+      hud.classList.add('scout-hud--open');
+      btn.classList.add('scout-fox-btn--active');
+      try { applyLayout(); } catch(e) { console.warn('[Scout] layout error:', e); }
+    } else {
+      hud.classList.remove('scout-hud--open');
+      btn.classList.remove('scout-fox-btn--active');
+      try { removeLayout(); } catch(e) { console.warn('[Scout] layout error:', e); }
+    }
+  }
+
+  // Find MyDay's root app container and shift it inward
+  // We try several selectors in order of preference
+  function getAppRoot() {
+    return (
+      document.querySelector('#app') ||
+      document.querySelector('#root') ||
+      document.querySelector('[class*="app-container"]') ||
+      document.querySelector('[class*="AppContainer"]') ||
+      document.querySelector('main') ||
+      document.body
+    );
+  }
+
+  // Returns true if the current page is a ticket (not dashboard/search/etc.)
+  function isTicketPage() {
+    // URL-based check is the most reliable — ticket pages have an ID in the path
+    if (/\/ticket\/|\/work-item\/|\/task\//i.test(location.href)) return true;
+    // Fallback: ticket pages have a host ID heading (e.g. WYN.WAA7HN53228LM)
+    const heading = document.querySelector('[id^="heading:rk"]');
+    if (heading && /[A-Z]{2,4}\.[A-Z0-9]{8,16}/.test(heading.textContent)) return true;
+    return false;
+  }
+
+  function applyLayout() {
+    // Don't squeeze non-ticket pages (dashboard, search, etc.)
+    if (!isTicketPage()) {
+      removeLayout();
+      return;
+    }
+
+    const root = getAppRoot();
+
+    // Only save the original margin once — never overwrite with Scout's own margins
+    if (!root.dataset.scoutOrigMarginSaved) {
+      root.dataset.scoutOrigMarginLeft   = root.style.marginLeft   || '';
+      root.dataset.scoutOrigMarginRight  = root.style.marginRight  || '';
+      root.dataset.scoutOrigMarginBottom = root.style.marginBottom || '';
+      root.dataset.scoutOrigMarginSaved  = '1';
+    }
+
+    // Use narrower panels when the Repair History table is visible
+    // so the table isn't squeezed into an unreadable strip
+    const repairTableVisible = !!document.querySelector('table th') &&
+      /broken\s+serial|consumed\s+serial/i.test(document.body.innerText.slice(0, 5000));
+    const w = repairTableVisible ? PANEL_W_NARROW : PANEL_W;
+
+    root.style.marginLeft   = w + 'px';
+    root.style.marginRight  = w + 'px';
+    root.style.marginBottom = BOTTOM_H + 'px';
+    root.style.transition   = 'margin 0.2s ease';
+
+    // Also update the panel widths dynamically
+    const leftPanel  = document.getElementById('scout-left');
+    const rightPanel = document.getElementById('scout-right');
+    if (leftPanel)  leftPanel.style.width  = w + 'px';
+    if (rightPanel) rightPanel.style.width = w + 'px';
+
+    document.body.style.overflowX = 'hidden';
+  }
+
+  function removeLayout() {
+    const root = getAppRoot();
+    // Restore only the Scout-specific margins — don't touch anything else
+    root.style.marginLeft   = root.dataset.scoutOrigMarginLeft   || '';
+    root.style.marginRight  = root.dataset.scoutOrigMarginRight  || '';
+    root.style.marginBottom = root.dataset.scoutOrigMarginBottom || '';
+    root.style.transition   = 'margin 0.2s ease';
+    // Clear the saved flag so next applyLayout re-saves correctly
+    delete root.dataset.scoutOrigMarginSaved;
+    delete root.dataset.scoutOrigMarginLeft;
+    delete root.dataset.scoutOrigMarginRight;
+    delete root.dataset.scoutOrigMarginBottom;
+    document.body.style.overflowX = '';
+  }
+
+  function showToast(msg) {
+    let toast = document.getElementById('scout-toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'scout-toast';
+      document.body.appendChild(toast);
+    }
+    toast.textContent = msg;
+    toast.classList.add('scout-toast--visible');
+    setTimeout(() => toast.classList.remove('scout-toast--visible'), 3000);
+  }
+  // Auto-logs activity as the tech works the ticket
+  // ────────────────────────────────────────────
+  const sessionSteps = [];
+
+  function logStep(text) {
+    const now = new Date();
+    const time = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    sessionSteps.push({ text, time });
+    renderSessionSteps();
+  }
+
+  function renderSessionSteps() {
+    const el = document.getElementById('val-session-steps');
+    if (!el) return;
+    if (sessionSteps.length === 0) {
+      el.innerHTML = '<em class="dim">Scout will track your steps here</em>';
+      return;
+    }
+    el.innerHTML = sessionSteps.map(s =>
+      `<div class="step-item">
+        <span class="step-time">${s.time}</span>
+        <span class="step-text">${s.text}</span>
+      </div>`
+    ).join('');
+    el.scrollTop = el.scrollHeight;
+    renderWhatIDid();
+  }
+
+  // ────────────────────────────────────────────
+  // WHAT I DID — auto-drafts from session steps
+  // ────────────────────────────────────────────
+  function renderWhatIDid() {
+    const el = document.getElementById('corr-what-i-did');
+    if (!el) return;
+
+    if (sessionSteps.length === 0) {
+      el.innerHTML = '<em class="dim">Scout will draft this as you work</em>';
+      return;
+    }
+
+    // Build a plain-text summary from what Scout tracked
+    const hostEl  = document.getElementById('val-ticket-id');
+    const host    = hostEl ? hostEl.textContent.split('\n')[0].trim() : '';
+    const titleEl = document.querySelector('[id^="heading:rk"]') ||
+                    document.querySelector('[class*="awsui_heading-text"]');
+    const title   = titleEl ? titleEl.textContent.trim().slice(0, 80) : '';
+
+    // Group steps into readable sentences
+    const tabsChecked = sessionSteps
+      .filter(s => s.text.startsWith('👁'))
+      .map(s => s.text.replace('👁 checked ', '').trim());
+    const linksOpened = sessionSteps
+      .filter(s => s.text.startsWith('🔗'))
+      .map(s => s.text.replace('🔗 opened ', '').trim());
+
+    const lines = [];
+    if (host)  lines.push('Host: ' + host);
+    if (title) lines.push('Ticket: ' + title);
+    lines.push('');
+    if (tabsChecked.length > 0) lines.push('Reviewed: ' + tabsChecked.join(', '));
+    if (linksOpened.length > 0) lines.push('Checked: ' + linksOpened.join(', '));
+
+    // Pull error message if we found one
+    const failedEl = document.getElementById('val-failed-test');
+    if (failedEl && failedEl.innerText && !failedEl.innerText.includes('no error')) {
+      lines.push('Error: ' + failedEl.innerText.replace(/\n/g, ' ').trim().slice(0, 100));
+    }
+
+    lines.push('');
+    lines.push('Root cause: ');
+    lines.push('Resolution: ');
+
+    el.innerHTML = lines.map(l =>
+      l === '' ? '<div class="wdid-spacer"></div>' :
+      '<div class="wdid-line">' + l.replace(/</g, '&lt;') + '</div>'
+    ).join('');
+  }
+  // ────────────────────────────────────────────
+  // NEED A HAND — reach-out draft
+  // ────────────────────────────────────────────
+  function scoutDraftReachOut() {
+    const el = document.getElementById('val-need-a-hand');
+    if (!el) return;
+
+    // Just use the current ticket URL — clean and direct
+    const ticketUrl = location.href;
+
+    el.innerHTML = `
+      <div style="font-size:11px; color:${C.textDim}; margin-bottom:4px">Tweak this to sound like you:</div>
+      <textarea class="reach-out-draft" id="reach-out-text">Hey, I could use a second set of eyes on this one. Here's the ticket: ${ticketUrl}
+
+Thanks for your time!</textarea>
+      <div style="display:flex; gap:6px; margin-top:5px">
+        <button class="nudge-btn nudge-btn--yes" id="btn-reach-copy">copy</button>
+        <button class="nudge-btn" id="btn-reach-dismiss">dismiss</button>
+      </div>
+    `;
+
+    document.getElementById('btn-reach-copy')?.addEventListener('click', () => {
+      const ta = document.getElementById('reach-out-text');
+      if (ta) {
+        GM_setClipboard(ta.value);
+        const btn = document.getElementById('btn-reach-copy');
+        if (btn) { const o = btn.textContent; btn.textContent = 'copied ✓'; setTimeout(() => btn.textContent = o, 1500); }
+      }
+    });
+    document.getElementById('btn-reach-dismiss')?.addEventListener('click', () => {
+      el.innerHTML = '';
+    });
+  }
+
+  // ────────────────────────────────────────────
+  // COPY
+  // ────────────────────────────────────────────
+  window.scoutCopy = function(id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    GM_setClipboard(el.innerText);
+    const btn = document.getElementById(id === 'corr-what-i-did' ? 'btn-copy-whatidid' : 'btn-copy-handoff');
+    if (btn) { const o = btn.textContent; btn.textContent = 'Copied ✓'; setTimeout(() => btn.textContent = o, 1500); }
+  };
+
+  // ────────────────────────────────────────────
+  // PAGE WATCHER
+  // ────────────────────────────────────────────
+  function startPageWatcher() {
+    let debounce;
+    let lastUrl = location.href;
+    // Guard: don't re-apply layout until the page has had time to settle
+    let pageReady = false;
+    setTimeout(() => { pageReady = true; }, 1500);
+
+    const observer = new MutationObserver(() => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => {
+        // Re-read if URL changed (SPA navigation)
+        if (location.href !== lastUrl) {
+          lastUrl = location.href;
+          resetTicketDisplay();
+          // After SPA nav, give the new page time to render before re-applying layout
+          pageReady = false;
+          setTimeout(() => {
+            pageReady = true;
+            if (isOpen) { try { applyLayout(); } catch(e) {} }
+          }, 1200);
+        }
+        readTicketData();
+        updateFoxVisibility();
+        // Only re-apply layout once the page is settled — prevents the
+        // stacked/broken layout glitch on refresh
+        if (isOpen && pageReady) {
+          try { applyLayout(); } catch(e) { console.warn('[Scout] layout error:', e); }
+        }
+      }, 600);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    setTimeout(readTicketData, 1500);
+  }
+
+  // Clear stale data when navigating to a new ticket
+  function resetTicketDisplay() {
+    visitedTabs.clear();
+    dismissedNudges.clear();
+    sessionSteps.length = 0;
+    // Auto-mark Overview again for the new ticket
+    setTimeout(() => { visitedTabs.add('Overview'); readTrailMap(); }, 2000);
+    const fields = ['val-ticket-id', 'val-ticket-sub', 'val-already-done',
+                    'val-quick-links', 'val-failed-test', 'trail-visited', 'trail-suggested'];
+    fields.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = '<em class="dim">reading...</em>';
+    });
+    const historyCard = document.getElementById('card-history');
+    if (historyCard) historyCard.style.display = 'none';
+    const needAHand = document.getElementById('val-need-a-hand');
+    if (needAHand) needAHand.innerHTML = '<em class="dim">Scout will check in after a while. You set the pace.</em>';
+    const whatIDid = document.getElementById('corr-what-i-did');
+    if (whatIDid) whatIDid.innerHTML = '<em class="dim">Scout will draft this as you work</em>';
+    GM_setValue('scout_corr_' + location.href, '');
+  }
+
+  // Tracks which tabs the tech has visited
+  const visitedTabs = new Set();
+
+  function readTicketData() {
+    const pageText = document.body.innerText;
+
+    // ── Host ID ──
+    // Standard host: WYN.WAA7HN53228LM
+    // Network device: sbn100-202-os-m1-p16-t2-r3 (from "Devices:" line in overview)
+    const idEl = document.getElementById('val-ticket-id');
+    const hostMatch = pageText.match(/\b([A-Z]{2,4}\.[A-Z0-9]{8,16})\b/);
+    const deviceMatch = pageText.match(/Devices?:\s*\n?\s*([a-z0-9][a-z0-9\-\.]{6,60})/i);
+    if (idEl) {
+      if (hostMatch) {
+        idEl.textContent = hostMatch[1];
+      } else if (deviceMatch) {
+        idEl.textContent = deviceMatch[1].trim();
+      }
+    }
+
+    // ── Severity ──
+    const severityEl = document.querySelector('[data-testid="severity"]');
+    const sevVal = severityEl ? severityEl.textContent.trim() : null;
+
+    // ── Ticket title ──
+    const titleEl = document.querySelector('[id^="heading:rk"]') ||
+                    document.querySelector('[class*="awsui_heading-text"]');
+    const subEl = document.getElementById('val-ticket-sub');
+    if (titleEl && subEl) {
+      const title = titleEl.textContent.trim();
+
+      // "Please repair X" — standard host ticket
+      const repairMatch = title.match(/Please repair ([A-Z_]+)/);
+      // Skynet event — network ticket: "Skynet V2 Event: device:fan:speed:low on ..."
+      const skynetMatch = title.match(/Skynet\s+V?\d*\s+Event:\s*([^\s]+(?::[^\s]+)*)/i) ||
+                          pageText.match(/Source event type:\s*([a-z0-9:._-]+)/i);
+      // NETWORK_BP prefix
+      const networkMatch = title.match(/\[NETWORK_BP[^\]]*\]/i);
+
+      let shortTitle;
+      if (repairMatch) {
+        shortTitle = repairMatch[1].replace(/_/g, ' ');
+      } else if (skynetMatch) {
+        shortTitle = skynetMatch[1];
+      } else if (networkMatch) {
+        // Strip bracket tags and show the meaningful part
+        shortTitle = title.replace(/\[[^\]]+\]/g, '').trim().slice(0, 80);
+      } else {
+        shortTitle = title.slice(0, 80);
+      }
+
+      subEl.innerHTML =
+        (sevVal ? `<span class="sev-badge">SEV ${sevVal}</span> ` : '') +
+        `<span class="ticket-type">${shortTitle}</span>`;
+    }
+
+    // ── Status ──
+    const statusEl = document.querySelector('[data-testid="status"]');
+    if (statusEl && subEl) {
+      const status = statusEl.textContent.trim();
+      if (status && !subEl.innerHTML.includes(status)) {
+        subEl.innerHTML += `<br><span class="status-text">${status}</span>`;
+      }
+    }
+
+    // ── Assignee ──
+    const assigneeEl = document.querySelector('[data-testid="assignee"]');
+    if (assigneeEl && idEl) {
+      const assignee = assigneeEl.textContent.trim();
+      if (assignee && !idEl.innerHTML.includes(assignee)) {
+        idEl.innerHTML += `<br><span class="assignee-text">👤 ${assignee}</span>`;
+      }
+    }
+
+    // ── WDID ──
+    const wdidMatch = pageText.match(/Work-(?:Definition-ID|Request-?Id)[^\d]*(\d+)/i);
+    if (wdidMatch && idEl && !idEl.innerHTML.includes('WDID')) {
+      idEl.innerHTML += `<br><span class="wdid-text">WDID ${wdidMatch[1]}</span>`;
+    }
+
+    // ── Host Has History warning ──
+    const historyCard = document.getElementById('card-history');
+    const historyVal  = document.getElementById('val-history');
+    if (historyCard && historyVal) {
+      const vettingMatch = pageText.match(/[Vv]etting\s+failures?[:\s]+(\d+)/);
+      const ticketsMatch = pageText.match(/[Tt]ickets?\s+created[:\s]+(\d+)/);
+      const openMatch    = pageText.match(/[Tt]ickets?\s+open[:\s]+(\d+)/);
+      if (vettingMatch || ticketsMatch) {
+        historyCard.style.display = 'block';
+        const lines = [];
+        if (vettingMatch) lines.push('Vetting failures: ' + vettingMatch[1]);
+        if (ticketsMatch) lines.push('Tickets created: ' + ticketsMatch[1]);
+        if (openMatch)    lines.push('Open: ' + openMatch[1]);
+        historyVal.innerHTML = lines.map(l => `<div class="history-line">· ${l}</div>`).join('');
+      } else {
+        historyCard.style.display = 'none';
+      }
+    }
+
+    readQuickLinks();
+    readTrailMap();
+    readNudges();
+    readFailedTest();
+    readCorrespondence();
+    readAlreadyDone();
+  }
+
+  // ────────────────────────────────────────────
+  // PREVIOUS REPAIRS SCRAPER
+  // Reads the Repair History table (Lambic data).
+  // Columns: Ticket | Broken Serial | Broken Model
+  //          | Consumed Serial | Consumed Model | Date
+  // Flags repairs within the last 3 months in amber.
+  // ────────────────────────────────────────────
+  function readAlreadyDone() {
+    const el = document.getElementById('val-already-done');
+    if (!el) return;
+
+    const now = Date.now();
+    const threeMonthsAgo = now - (90 * 24 * 60 * 60 * 1000);
+
+    // Find the visible Repair History tab panel OR the full-page Lambic table
+    const allPanels = Array.from(document.querySelectorAll('[role="tabpanel"], [class*="tab-content"], [class*="tabpanel"]'));
+    let repairPanel = allPanels.find(function(p) {
+      if (p.offsetParent === null) return false;
+      const text = p.innerText || '';
+      return /broken\s+serial|consumed\s+serial|broken\s+model/i.test(text);
+    });
+
+    // Fallback: the Lambic table might be directly in the page (not in a tab panel)
+    if (!repairPanel) {
+      const tables = Array.from(document.querySelectorAll('table'));
+      const lambicTable = tables.find(function(t) {
+        return /broken\s+serial|consumed\s+serial|broken\s+model/i.test(t.innerText);
+      });
+      if (lambicTable) repairPanel = lambicTable.closest('div, section, main') || lambicTable.parentElement;
+    }
+
+    if (!repairPanel) {
+      el.innerHTML = '<em class="dim">open the Repair History tab</em>';
+      return;
+    }
+
+    const rows = Array.from(repairPanel.querySelectorAll('tr'));
+    const found = [];
+    const seen = new Set();
+    const modelCounts = {};
+
+    // First pass: count how many times each model appears
+    rows.forEach(function(row) {
+      const cells = Array.from(row.querySelectorAll('td'));
+      if (cells.length < 4) return;
+      const modelCell = cells.length >= 5 ? cells[4].innerText.trim() : cells[2].innerText.trim();
+      if (!modelCell) return;
+      const key = modelCell.slice(0, 50);
+      modelCounts[key] = (modelCounts[key] || 0) + 1;
+    });
+
+    // Second pass: build entries, one per unique model with count + most recent date
+    rows.forEach(function(row) {
+      const cells = Array.from(row.querySelectorAll('td'));
+      if (cells.length < 4) return;
+
+      const dateCell  = cells[cells.length - 1].innerText.trim();
+      const modelCell = cells.length >= 5 ? cells[4].innerText.trim() : cells[2].innerText.trim();
+      const ticketCell = cells[0].innerText.trim();
+
+      if (!dateCell || !modelCell) return;
+      const key = modelCell.slice(0, 50);
+      if (seen.has(key)) return; // already captured this model — skip duplicates
+      seen.add(key);
+
+      let isRecent = false;
+      let dateStr = dateCell.split(' ').slice(0, 1).join(' ');
+      const parsed = new Date(dateCell);
+      if (!isNaN(parsed.getTime())) {
+        isRecent = parsed.getTime() > threeMonthsAgo;
+        dateStr = parsed.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      }
+
+      const count = modelCounts[key] || 1;
+
+      found.push({
+        model:    modelCell.slice(0, 60),
+        date:     dateStr,
+        isRecent: isRecent,
+        count:    count
+      });
+    });
+
+    if (found.length === 0) {
+      el.innerHTML = '<em class="dim">no repairs found — open Repair History tab</em>';
+      return;
+    }
+
+    el.innerHTML = found.map(function(f) {
+      const cls     = f.isRecent ? 'already-done-item already-done-item--recent' : 'already-done-item';
+      const icon    = f.isRecent ? '⚠ ' : '✓ ';
+      const dateTag = '<span class="repair-date">' + f.date + '</span> ';
+      const countTag = f.count > 1 ? '<span class="repair-count">×' + f.count + '</span> ' : '';
+      return '<div class="' + cls + '">' + icon + dateTag + countTag + f.model.replace(/</g, '&lt;') + '</div>';
+    }).join('');
+  }
+
+  // ────────────────────────────────────────────
+  // FAILED TEST / ERROR MESSAGE SCRAPER
+  // Grabs the actual error message from the ticket overview
+  // and surfaces it directly — no guessing needed.
+  // ────────────────────────────────────────────
+  function readFailedTest() {
+    const el = document.getElementById('val-failed-test');
+    if (!el) return;
+
+    const pageText = document.body.innerText;
+    const lines = [];
+
+    // ── BladeRunner / network JSON block ──
+    // Pull the event type and any failed component IDs, combine into one line
+    const fanMatch = pageText.match(/"Failed Fan IDs?":\s*\[([^\]]+)\]/i);
+    const partMatch = pageText.match(/"Failed Part IDs?":\s*\[([^\]]+)\]/i);
+    const skynetTypeMatch = pageText.match(/Source event type:\s*([a-z0-9:._-]+)/i);
+    if (skynetTypeMatch) {
+      // Append any failed component IDs to the event line
+      const failedIds = fanMatch
+        ? fanMatch[1].replace(/["]/g, '').trim()
+        : partMatch
+          ? partMatch[1].replace(/["]/g, '').trim()
+          : null;
+      const eventText = failedIds
+        ? `${skynetTypeMatch[1]} — ${failedIds}`
+        : skynetTypeMatch[1];
+      lines.push({ label: 'Event', text: eventText });
+    }
+
+    // ── "Please repair X" from ticket title — shown in ticket sub, not needed here ──
+
+    // ── Primary: "Error message is:" block ──
+    const errMsgMatch = pageText.match(/Error message is[:\s]*\n([\s\S]{0,400}?)(?:\n\n|\nDIMM|\nWork-Definition|\nPlatform|\nServer-Details|$)/i);
+    if (errMsgMatch) {
+      const errText = errMsgMatch[1].trim().replace(/\n/g, ' ').slice(0, 200);
+      if (errText) lines.push({ label: 'Error', text: errText });
+    }
+
+    // ── Fallback: ISO test names ──
+    if (lines.length === 0) {
+      const testMatches = pageText.match(/\b([A-Z][A-Z0-9_]{3,}(?:_TEST|_DIAG|_CHECK|_STRESS|_SCAN|_VERIFY|_FAIL|_ERROR))\b/g);
+      if (testMatches) {
+        [...new Set(testMatches)].slice(0, 3).forEach(t =>
+          lines.push({ label: 'Test', text: t.replace(/_/g, ' ') })
+        );
+      }
+    }
+
+    if (lines.length === 0) {
+      el.innerHTML = '<em class="dim">no error message detected — check the Overview tab</em>';
+    } else {
+      el.innerHTML = lines.map(l =>
+        '<div class="failed-test-item"><span class="failed-test-label">' + l.label + '</span> ' +
+        l.text.replace(/</g, '&lt;') + '</div>'
+      ).join('');
+    }
+  }
+
+  // ────────────────────────────────────────────
+  // CORRESPONDENCE SCRAPER
+  // Only surfaces entries written by real techs.
+  // Filters out all bot/system/autobot authors.
+  // ────────────────────────────────────────────
+  function readCorrespondence() {
+    const alreadyDoneEl = document.getElementById('corr-already-done');
+    if (!alreadyDoneEl) return;
+
+    // Anything matching these patterns is a bot/system — skip entirely
+    const BOT_AUTHORS = /autobot|cfg-mobility|aws:iam|flx-|myday-|system|automated|notif|provisioning|platform/i;
+
+    // The Communication tab text — split by "added by" to find each entry's author
+    const commText = document.body.innerText;
+    const blocks = commText.split(/added by\s+/i).slice(1);
+    const humanBlocks = [];
+    const seen = new Set();
+
+    blocks.forEach(function(block) {
+      // First token is the author login (e.g. "carsny" or "flx-autobot-myday-cmh")
+      const authorMatch = block.match(/^(\S+)/);
+      if (!authorMatch) return;
+      const author = authorMatch[1].replace(/[^a-zA-Z0-9\-_]/g, '');
+      if (BOT_AUTHORS.test(author)) return;
+
+      // Get the body — skip the author+date line, take the next meaningful lines
+      const lines = block.split('\n').slice(1)
+        .map(function(l) { return l.trim(); })
+        .filter(function(l) { return l.length > 10 && !/^(on |added |preview|show)/i.test(l); });
+
+      if (lines.length === 0) return;
+
+      const body = lines.slice(0, 4).join(' ').slice(0, 250);
+      const key = body.slice(0, 40);
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      humanBlocks.push(
+        '<div class="corr-entry">' +
+        '<span class="corr-author">' + author.replace(/</g, '&lt;') + ':</span> ' +
+        body.replace(/</g, '&lt;') +
+        '</div>'
+      );
+    });
+
+    if (humanBlocks.length > 0) {
+      alreadyDoneEl.innerHTML = humanBlocks.slice(0, 4).join('');
+      // Cache keyed to this specific ticket URL
+      const cacheKey = 'scout_corr_' + location.href;
+      GM_setValue(cacheKey, humanBlocks.slice(0, 4).join(''));
+    } else {
+      // Only load cache if it's for this exact ticket
+      const cacheKey = 'scout_corr_' + location.href;
+      const cached = GM_getValue(cacheKey, '');
+      if (cached) {
+        alreadyDoneEl.innerHTML = cached;
+      } else {
+        alreadyDoneEl.innerHTML = '<em class="dim">no tech correspondence yet</em>';
+      }
+    }
+  }
+
+  // Only surface high-value links that aren't already obvious on the page
+  // These are the tools techs actually need to hunt for
+  const PRIORITY_LINKS = [
+    'Lambic', 'Gose', 'Dunkel',
+  ];
+
+  // ── Quick Links ──
+  // Surfaces priority tool links only
+  function readQuickLinks() {
+    const linksEl = document.getElementById('val-quick-links');
+    if (!linksEl) return;
+
+    const found = [];
+    const seenTools = new Set();
+
+    // Use noopener links — these are the tool links MyDay renders
+    const allLinks = Array.from(document.querySelectorAll('a[rel*="noopener"]'));
+    allLinks.forEach(a => {
+      const text = a.textContent.trim();
+      const href = a.href;
+      if (!text || !href || href === '#') return;
+
+      // Exact match only to avoid false positives on short names like SIM
+      const matchedTool = PRIORITY_LINKS.find(t => text.toLowerCase() === t.toLowerCase());
+      if (matchedTool && !seenTools.has(matchedTool.toLowerCase())) {
+        seenTools.add(matchedTool.toLowerCase());
+        found.push({ text, href });
+      }
+    });
+
+    if (found.length === 0) {
+      linksEl.innerHTML = '<a class="scout-link" href="https://t.corp.amazon.com" target="_blank" rel="noopener noreferrer">→ t.corp</a>';
+    } else {
+      linksEl.innerHTML = '<a class="scout-link" href="https://t.corp.amazon.com" target="_blank" rel="noopener noreferrer">→ t.corp</a>' +
+        found.map(l =>
+          `<a class="scout-link" href="${l.href}" target="_blank" rel="noopener noreferrer">→ ${l.text}</a>`
+        ).join('');
+    }
+  }
+
+  // ────────────────────────────────────────────
+  // NUDGE ENGINE
+  // Pattern-matches ticket content and surfaces
+  // contextual nudges in the right panel.
+  // Each nudge has an id so dismissed ones are
+  // remembered across the session.
+  // ────────────────────────────────────────────
+
+  const dismissedNudges = new Set();
+
+  // Nudge definitions - each has:
+  //   id       - unique, used to track dismissals
+  //   match    - function(title, pageText) => boolean
+  //   text     - what Scout says
+  //   outside  - true = "outside the box" style nudge (different color)
+  const NUDGE_RULES = [
+    // ── Always: batch + work ready reminder ──
+    // This fires on every ticket as a baseline reminder
+    {
+      id: 'batch-work-ready',
+      match: () => true,
+      text: 'Before starting any repair — make sure the ticket is batched and the host is Work Ready.',
+    },
+    // ── RPO ──
+    {
+      id: 'rpo-warning',
+      match: (t) => /RPO/i.test(t),
+      text: 'RPO ticket — read through ALL prior tickets and correspondence before touching anything. There is important history here.',
+    },
+    // ── IO Board / Motherboard ──
+    {
+      id: 'lambic-io-mb',
+      match: (t) => /IO.BOARD|MOTHERBOARD|IO_BOARD/i.test(t),
+      text: 'Check Lambic for repair history before touching an IO board or motherboard. Know what has already been tried.',
+    },
+    // ── Memory / DIMM ──
+    {
+      id: 'memory-dimm',
+      match: (t) => /MEMORY|DIMM|MLA_DIAG|kildare/i.test(t),
+      text: 'Check HWMon for the exact DIMM slot location before heading to the floor. Only replace what the WDID specifies.',
+    },
+    // ── GPU / K2 Link ──
+    {
+      id: 'link-gpu-k2',
+      match: (t) => /GPU.*LINK|K2.*LINK|LINK.*GPU|LINK.*K2/i.test(t),
+      text: 'Link ticket — check the JBOG map to confirm which component is affected. Only work within the scope of the WDID.',
+    },
+    // ── SSD / NVMe / Drive ──
+    {
+      id: 'ssd-drive',
+      match: (t) => /\bSSD\b|NVME|NVM_DIAG|DRIVE.*FAIL|DISK.*FAIL/i.test(t),
+      text: 'Drive ticket — confirm the exact slot in HWMon before pulling anything. Only replace what the WDID calls for.',
+    },
+    // ── GPU ──
+    {
+      id: 'gpu-replace',
+      match: (t) => /\bGPU\b|GPU_DIAG/i.test(t),
+      text: 'GPU ticket — check Lambic for prior GPU work on this host. Only replace the component specified in the WDID.',
+    },
+    // ── Power supply / PSU ──
+    {
+      id: 'psu',
+      match: (t) => /PSU|POWER.*SUPPLY|PWR.*FAIL|POWER.*FAIL/i.test(t),
+      text: 'PSU ticket — check Lambic for repeated power failures before proceeding. Work within the WDID scope.',
+    },
+    // ── Fan / Thermal ──
+    {
+      id: 'fan-thermal',
+      match: (t) => /\bFAN\b|THERMAL|TEMP.*FAIL|OVERHEAT/i.test(t),
+      text: 'Thermal ticket — clear airflow blockers and verify all fans are seated before replacing any components.',
+    },
+    // ── Cable ──
+    {
+      id: 'cable',
+      match: (t) => /CABLE|GPIO.*CABLE|CABLE.*FAIL/i.test(t),
+      text: 'Cable ticket — check the runbook for the cable map. The lid sticker may also have routing info.',
+    },
+    // ── HSC Overcurrent ──
+    {
+      id: 'hsc-overcurrent',
+      match: (t) => /HSC.*OVERCURRENT|OVERCURRENT/i.test(t),
+      text: 'HSC overcurrent — check the JBOG map to identify the affected component. Work within the WDID scope only.',
+    },
+    // ── Vetting history ──
+    {
+      id: 'vetting-history',
+      match: (t, p) => /VETTING/i.test(t) && /vetting failures/i.test(p),
+      text: 'This host has vetting failures on record. Read the full history before making any changes.',
+    },
+    // ── Wrap up ──
+    {
+      id: 'wrap-up',
+      match: (t, p) => {
+        const resolutionEl = document.querySelector('[data-testid="resolution"], [data-testid="root-cause"]');
+        const hasContent = resolutionEl && resolutionEl.textContent.trim().length > 5;
+        return hasContent && /resolved|resolution|root cause/i.test(p);
+      },
+      text: 'Wrapping up — make sure root cause and resolution fields are filled in before closing. Check the bottom bar to draft your correspondence.',
+    },
+  ];
+
+  function readNudges() {
+    const nudgeList = document.getElementById('nudge-list');
+    if (!nudgeList) return;
+
+    const titleEl = document.querySelector('[id^="heading:rk"]') ||
+                    document.querySelector('[class*="awsui_heading-text"]');
+    const title    = titleEl ? titleEl.textContent.trim().toUpperCase() : '';
+    const pageText = document.body.innerText;
+
+    const active = NUDGE_RULES.filter(rule =>
+      !dismissedNudges.has(rule.id) && rule.match(title, pageText)
+    );
+
+    if (active.length === 0) {
+      nudgeList.innerHTML = `
+        <div class="nudge-card">
+          <div class="nudge-text dim">Scout will surface nudges as it reads the ticket.</div>
+        </div>`;
+      return;
+    }
+
+    nudgeList.innerHTML = active.map(rule => `
+      <div class="nudge-card ${rule.outside ? 'nudge-card--outside' : ''}" data-nudge-id="${rule.id}">
+        <div class="nudge-text">${rule.outside ? '💡 ' : ''}${rule.text}</div>
+        <div class="nudge-reactions">
+          <button class="nudge-btn nudge-btn--yes">👍 helpful</button>
+          <button class="nudge-btn nudge-btn--no">not quite</button>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  window.scoutNudgeReact = function(id, helpful) {
+    dismissedNudges.add(id);
+    if (!helpful) {
+      // Log unhelpful nudges so they can be reviewed later
+      const log = JSON.parse(GM_getValue('scout_nudge_feedback', '[]'));
+      log.push({ id, helpful: false, ts: Date.now() });
+      GM_setValue('scout_nudge_feedback', JSON.stringify(log));
+    }
+    readNudges();
+  };
+  const TRAIL_TABS = [
+    'Overview',
+    'Instructions',
+    'Communication',
+    'Repair History',
+    'Previous Actions',
+    'Audit Trail',
+  ];
+
+  // External tools worth checking - tracked by link clicks
+  const TRAIL_TOOLS = ['Lambic'];
+
+  function readTrailMap() {
+    const visitedEl   = document.getElementById('trail-visited');
+    const suggestedEl = document.getElementById('trail-suggested');
+    if (!visitedEl || !suggestedEl) return;
+
+    // Watch MyDay tabs - only the ones in our list
+    const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+    tabs.forEach(tab => {
+      const label = tab.textContent.trim();
+      const isTracked = TRAIL_TABS.some(t => label.toLowerCase().includes(t.toLowerCase()));
+      if (!isTracked) return;
+
+      if (!tab.dataset.scoutWatched) {
+        tab.dataset.scoutWatched = '1';
+        tab.addEventListener('click', () => {
+          visitedTabs.add(label);
+          logStep(`👁 checked ${label}`);
+          readTrailMap();
+        });
+      }
+      if (tab.getAttribute('aria-selected') === 'true') {
+        visitedTabs.add(label);
+      }
+    });
+
+    // Watch Lambic link clicks
+    const allLinks = Array.from(document.querySelectorAll('a[rel*="noopener"]'));
+    allLinks.forEach(a => {
+      const text = a.textContent.trim();
+      const isTracked = TRAIL_TOOLS.some(t => text.toLowerCase() === t.toLowerCase());
+      if (!isTracked || a.dataset.scoutWatched) return;
+      a.dataset.scoutWatched = '1';
+      a.addEventListener('click', () => {
+        visitedTabs.add(text);
+        logStep(`🔗 opened ${text}`);
+        readTrailMap();
+      });
+    });
+
+    // Build the full checklist from both lists
+    const allItems = [...TRAIL_TABS, ...TRAIL_TOOLS];
+    const visited    = allItems.filter(t => Array.from(visitedTabs).some(v => v.toLowerCase().includes(t.toLowerCase())));
+    const notVisited = allItems.filter(t => !Array.from(visitedTabs).some(v => v.toLowerCase().includes(t.toLowerCase())));
+
+    visitedEl.innerHTML = visited.length === 0
+      ? '<em class="dim">nothing yet</em>'
+      : visited.map(t => `<div class="trail-item trail-item--done">✓ ${t}</div>`).join('');
+
+    suggestedEl.innerHTML = notVisited.length === 0
+      ? '<div class="trail-item trail-item--done">✓ all checked</div>'
+      : notVisited.map(t => `<div class="trail-item trail-item--todo">→ ${t}</div>`).join('');
+  }
+
+  // ────────────────────────────────────────────
+  // STYLES
+  // ────────────────────────────────────────────
+  function injectStyles() {
+    const s = document.createElement('style');
+    s.textContent = `
+
+      /* ── Reach-out draft ── */
+      .reach-out-draft {
+        width: 100%;
+        min-height: 60px;
+        background: #21262d;
+        border: 1px solid ${C.accentDim};
+        border-radius: 4px;
+        color: ${C.text};
+        font-size: 11px;
+        font-family: inherit;
+        padding: 6px 8px;
+        resize: vertical;
+        box-sizing: border-box;
+        line-height: 1.4;
+      }
+      .reach-out-draft:focus { outline: none; border-color: ${C.accent}; }
+
+      /* ── Reach-out button ── */
+      .scout-reach-btn {
+        background: #21262d;
+        border: 1px solid ${C.accentDim};
+        border-radius: 4px;
+        color: ${C.accent};
+        font-size: 11px;
+        font-weight: 600;
+        padding: 4px 10px;
+        cursor: pointer;
+        width: 100%;
+        text-align: left;
+        transition: background 0.15s;
+      }
+      .scout-reach-btn:hover { background: ${C.accentDim}; color: #fff; }
+
+      /* ── Fox button ── */
+      #scout-fox-btn {
+        position: fixed;
+        bottom: 20px;
+        right: 16px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 46px;
+        height: 46px;
+        background: ${C.panel};
+        border: 1px solid ${C.accentDim};
+        border-radius: 50%;
+        cursor: pointer;
+        z-index: 2147483647;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+        transition: box-shadow 0.2s, border-color 0.2s;
+        user-select: none;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      }
+      #scout-fox-btn:hover { border-color: ${C.accent}; }
+      #scout-fox-btn.scout-fox-btn--active {
+        border-color: ${C.foxGlow};
+        box-shadow: 0 0 0 2px ${C.foxGlow}, 0 4px 16px rgba(0,0,0,0.5);
+      }
+      .fox-emoji  { font-size: 22px; line-height: 1; }
+      .fox-label  { display: none; }
+
+      /* ── HUD root — fixed, full viewport, pointer-events off by default ── */
+      #scout-hud {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483640;
+        pointer-events: none;
+        display: none;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        font-size: 12px;
+        color: ${C.text};
+        line-height: 1.5;
+      }
+      #scout-hud.scout-hud--open { display: block; }
+
+      /* ── Top bar ── */
+      #scout-topbar { display: none; }
+
+      /* ── Side panels ── */
+      .scout-panel {
+        position: fixed;
+        top: 0;
+        bottom: ${BOTTOM_H}px;
+        width: ${PANEL_W}px;
+        background: ${C.bg};
+        border-top: none;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding: 8px 8px 12px;
+        pointer-events: all;
+        display: none;
+        flex-direction: column;
+        gap: 6px;
+        scrollbar-width: thin;
+        scrollbar-color: ${C.accentDim} transparent;
+      }
+      #scout-hud.scout-hud--open .scout-panel {
+        display: flex;
+      }
+      #scout-left  {
+        left: 0;
+        border-right: 1px solid ${C.accentDim};
+      }
+      #scout-right {
+        right: 0;
+        border-left: 1px solid ${C.accentDim};
+      }
+
+      /* ── Bottom bar ── */
+      #scout-bottom {
+        position: fixed;
+        bottom: 0; left: 0; right: 0;
+        height: ${BOTTOM_H}px;
+        background: ${C.bg};
+        border-top: 1px solid ${C.accentDim};
+        display: none;
+        align-items: stretch;
+        pointer-events: all;
+        padding: 8px 12px;
+        gap: 12px;
+        z-index: 2147483641;
+      }
+      #scout-hud.scout-hud--open #scout-bottom {
+        display: flex;
+      }
+      #scout-bottom-left {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 0;
+      }
+
+      /* ── Panel headers ── */
+      .panel-header {
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.07em;
+        color: ${C.accent};
+        text-transform: uppercase;
+        padding-bottom: 4px;
+        border-bottom: 1px solid ${C.accentDim};
+        flex-shrink: 0;
+      }
+
+      /* ── Cards ── */
+      .scout-card {
+        background: ${C.cardBg};
+        border: 1px solid #21262d;
+        border-radius: 6px;
+        padding: 5px 8px;
+        flex-shrink: 0;
+      }
+      .scout-card--warning {
+        border-color: ${C.warning};
+        background: rgba(240,165,0,0.07);
+      }
+      .card-label {
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.07em;
+        color: ${C.textDim};
+        text-transform: uppercase;
+        margin-bottom: 2px;
+      }
+      .card-value { font-size: 12px; color: ${C.text}; }
+      .card-sub   { font-size: 11px; color: ${C.textDim}; margin-top: 2px; }
+
+      /* ── Trail map ── */
+      .trail-section-label {
+        font-size: 10px;
+        font-weight: 600;
+        color: ${C.textDim};
+        margin-bottom: 2px;
+      }
+      .trail-item { font-size: 11px; padding: 1px 0; display: flex; align-items: center; gap: 4px; }
+      .trail-item--done { color: ${C.success}; }
+      .trail-item--todo { color: ${C.textDim}; }
+
+      /* ── Nudge cards ── */
+      #nudge-list { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+      .nudge-card {
+        background: ${C.nudgeBg};
+        border: 1px solid #2d3748;
+        border-radius: 6px;
+        padding: 7px 9px;
+      }
+      .nudge-text { font-size: 12px; color: ${C.text}; line-height: 1.4; }
+      .nudge-reactions { display: flex; gap: 6px; margin-top: 5px; }
+      .nudge-btn {
+        background: #21262d;
+        border: 1px solid #30363d;
+        border-radius: 4px;
+        color: ${C.text};
+        font-size: 11px;
+        padding: 2px 8px;
+        cursor: pointer;
+      }
+      .nudge-btn:hover { background: #30363d; }
+      .nudge-card--outside {
+        border-color: ${C.accent};
+        background: rgba(57,208,200,0.05);
+      }
+
+      /* ── Bottom bar content ── */
+      .bottom-title {
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.07em;
+        color: ${C.accent};
+        text-transform: uppercase;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .scout-collapse-btn {
+        background: ${C.accentDim};
+        border: 1px solid ${C.accent};
+        border-radius: 4px;
+        color: ${C.text};
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+        padding: 2px 8px;
+        line-height: 1.4;
+        transition: background 0.15s, color 0.15s;
+        flex-shrink: 0;
+        letter-spacing: 0.05em;
+      }
+      .scout-collapse-btn:hover { background: ${C.accent}; color: #000; }
+      #scout-bottom {
+        transition: height 0.2s ease;
+        overflow: hidden;
+      }
+      #scout-corr-cols { display: flex; gap: 12px; flex: 1; min-height: 0; }
+      .corr-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+      .corr-col-title { font-size: 10px; font-weight: 600; color: ${C.success}; }
+      .corr-col-body {
+        font-size: 11px;
+        color: ${C.text};
+        overflow-y: auto;
+        max-height: 80px;
+        scrollbar-width: thin;
+        scrollbar-color: ${C.accentDim} transparent;
+      }
+      #scout-corr-btns { display: flex; gap: 8px; }
+      .scout-copy-btn {
+        background: #21262d;
+        border: 1px solid ${C.accentDim};
+        border-radius: 4px;
+        color: ${C.accent};
+        font-size: 11px;
+        font-weight: 600;
+        padding: 3px 12px;
+        cursor: pointer;
+        transition: background 0.15s;
+      }
+      .scout-copy-btn:hover { background: ${C.accentDim}; color: #fff; }
+
+      /* ── Utility ── */
+      .dim { color: ${C.textDim}; font-style: italic; }
+      .sev-badge {
+        display: inline-block;
+        background: #1a3a6b;
+        color: #79b8ff;
+        border: 1px solid #1f6feb;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: 700;
+        padding: 1px 5px;
+        vertical-align: middle;
+      }
+      .ticket-type {
+        font-size: 11px;
+        color: ${C.text};
+        font-weight: 600;
+      }
+      .status-text {
+        font-size: 10px;
+        color: ${C.success};
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .history-line {
+        font-size: 11px;
+        color: ${C.warning};
+        line-height: 1.6;
+      }
+      .assignee-text {
+        font-size: 10px;
+        color: ${C.textDim};
+      }
+      .wdid-text {
+        font-size: 10px;
+        color: ${C.accent};
+        font-weight: 600;
+        letter-spacing: 0.03em;
+      }
+      .scout-link {
+        display: block;
+        font-size: 11px;
+        color: ${C.accent};
+        text-decoration: none;
+        padding: 1px 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .scout-link:hover { text-decoration: underline; }
+      /* ── Eva button ── */
+      .scout-eva-btn {
+        background: #1a3a6b;
+        border: 1px solid #1f6feb;
+        border-radius: 4px;
+        color: #79b8ff;
+        font-size: 10px;
+        font-weight: 600;
+        padding: 3px 8px;
+        cursor: pointer;
+        width: 100%;
+        text-align: left;
+        transition: background 0.15s;
+      }
+      .scout-eva-btn:hover { background: #1f4a8b; }
+      /* ── Toast ── */
+      #scout-toast {
+        position: fixed;
+        bottom: 140px;
+        left: 50%;
+        transform: translateX(-50%) translateY(10px);
+        background: #1f6feb;
+        color: #fff;
+        font-size: 12px;
+        font-weight: 600;
+        padding: 8px 16px;
+        border-radius: 6px;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.2s, transform 0.2s;
+        z-index: 2147483647;
+        white-space: nowrap;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      }
+      #scout-toast.scout-toast--visible {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+      }
+      /* ── Session steps ── */
+      #val-session-steps {
+        max-height: 120px;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: ${C.accentDim} transparent;
+      }
+      .step-item {
+        display: flex;
+        gap: 5px;
+        align-items: baseline;
+        padding: 1px 0;
+        font-size: 11px;
+        line-height: 1.4;
+      }
+      .step-time {
+        color: ${C.textDim};
+        font-size: 10px;
+        flex-shrink: 0;
+        font-variant-numeric: tabular-nums;
+      }
+      .step-text {
+        color: ${C.text};
+      }
+
+      /* ── What I Did draft ── */
+      .wdid-line {
+        font-size: 11px;
+        color: ${C.text};
+        line-height: 1.5;
+      }
+      .wdid-spacer { height: 4px; }
+
+      /* ── Already done items ── */
+      .already-done-item {
+        font-size: 11px;
+        color: ${C.success};
+        padding: 1px 0;
+        line-height: 1.5;
+        word-break: break-word;
+      }
+      .already-done-item--recent {
+        color: ${C.warning};
+      }
+      .repair-date {
+        font-size: 10px;
+        color: ${C.textDim};
+        font-weight: 600;
+      }
+      .repair-count {
+        font-size: 10px;
+        font-weight: 700;
+        color: ${C.accent};
+        background: rgba(57,208,200,0.12);
+        border-radius: 3px;
+        padding: 0 4px;
+        margin-right: 2px;
+      }
+      .failed-test-item {
+        font-size: 11px;
+        color: ${C.warning};
+        font-weight: 500;
+        padding: 2px 0;
+        line-height: 1.5;
+        word-break: break-word;
+      }
+      .failed-test-label {
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: ${C.textDim};
+        margin-right: 4px;
+      }
+
+      /* ── Correspondence entries ── */
+      .corr-entry {
+        font-size: 11px;
+        color: ${C.text};
+        line-height: 1.4;
+        padding: 2px 0;
+        border-bottom: 1px solid #21262d;
+        word-break: break-word;
+      }
+      .corr-entry:last-child { border-bottom: none; }
+      .corr-author {
+        font-size: 10px;
+        font-weight: 700;
+        color: ${C.accent};
+      }
+
+      /* ── Scrollbars ── */
+      .scout-panel::-webkit-scrollbar { width: 4px; }
+      .scout-panel::-webkit-scrollbar-track { background: transparent; }
+      .scout-panel::-webkit-scrollbar-thumb { background: ${C.accentDim}; border-radius: 2px; }
+
+    `;
+    document.head.appendChild(s);
+  }
+
+  // ── Go ──
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+})();
