@@ -136,7 +136,7 @@
         <div class="panel-header">🦊 The Full Picture</div>
 
         <div class="scout-card">
-          <div class="card-label">TICKET</div>
+          <div class="card-label">HOST</div>
           <div class="card-value" id="val-ticket-id">—</div>
           <div class="card-sub"  id="val-ticket-sub">reading ticket...</div>
         </div>
@@ -599,19 +599,17 @@ Thanks for your time!</textarea>
     const severityEl = document.querySelector('[data-testid="severity"]');
     const sevVal = severityEl ? severityEl.textContent.trim() : null;
 
-    // ── Ticket title ──
+    // ── Ticket title → goes in the big value (val-ticket-id) ──
     const titleEl = document.querySelector('[id^="heading:rk"]') ||
                     document.querySelector('[class*="awsui_heading-text"]');
+    const idEl2 = document.getElementById('val-ticket-id');
     const subEl = document.getElementById('val-ticket-sub');
-    if (titleEl && subEl) {
+    if (titleEl && idEl2) {
       const title = titleEl.textContent.trim();
 
-      // "Please repair X" — standard host ticket
       const repairMatch = title.match(/Please repair ([A-Z_]+)/);
-      // Skynet event — network ticket: "Skynet V2 Event: device:fan:speed:low on ..."
       const skynetMatch = title.match(/Skynet\s+V?\d*\s+Event:\s*([^\s]+(?::[^\s]+)*)/i) ||
                           pageText.match(/Source event type:\s*([a-z0-9:._-]+)/i);
-      // NETWORK_BP prefix
       const networkMatch = title.match(/\[NETWORK_BP[^\]]*\]/i);
 
       let shortTitle;
@@ -620,39 +618,44 @@ Thanks for your time!</textarea>
       } else if (skynetMatch) {
         shortTitle = skynetMatch[1];
       } else if (networkMatch) {
-        // Strip bracket tags and show the meaningful part
         shortTitle = title.replace(/\[[^\]]+\]/g, '').trim().slice(0, 80);
       } else {
         shortTitle = title.slice(0, 80);
       }
 
-      subEl.innerHTML =
+      idEl2.innerHTML =
         (sevVal ? `<span class="sev-badge">SEV ${sevVal}</span> ` : '') +
         `<span class="ticket-type">${shortTitle}</span>`;
     }
 
+    // ── Host ID → goes in the sub line ──
+    if (subEl) {
+      const hostVal = hostMatch ? hostMatch[1] : (deviceMatch ? deviceMatch[1].trim() : null);
+      if (hostVal) subEl.textContent = hostVal;
+    }
+
     // ── Status ──
     const statusEl = document.querySelector('[data-testid="status"]');
-    if (statusEl && subEl) {
+    if (statusEl && idEl2) {
       const status = statusEl.textContent.trim();
-      if (status && !subEl.innerHTML.includes(status)) {
-        subEl.innerHTML += `<br><span class="status-text">${status}</span>`;
+      if (status && !idEl2.innerHTML.includes(status)) {
+        idEl2.innerHTML += `<br><span class="status-text">${status}</span>`;
       }
     }
 
     // ── Assignee ──
     const assigneeEl = document.querySelector('[data-testid="assignee"]');
-    if (assigneeEl && idEl) {
+    if (assigneeEl && subEl) {
       const assignee = assigneeEl.textContent.trim();
-      if (assignee && !idEl.innerHTML.includes(assignee)) {
-        idEl.innerHTML += `<br><span class="assignee-text">👤 ${assignee}</span>`;
+      if (assignee && !subEl.innerHTML.includes(assignee)) {
+        subEl.innerHTML += `<br><span class="assignee-text">👤 ${assignee}</span>`;
       }
     }
 
     // ── WDID ──
     const wdidMatch = pageText.match(/Work-(?:Definition-ID|Request-?Id)[^\d]*(\d+)/i);
-    if (wdidMatch && idEl && !idEl.innerHTML.includes('WDID')) {
-      idEl.innerHTML += `<br><span class="wdid-text">WDID ${wdidMatch[1]}</span>`;
+    if (wdidMatch && subEl && !subEl.innerHTML.includes('WDID')) {
+      subEl.innerHTML += `<br><span class="wdid-text">WDID ${wdidMatch[1]}</span>`;
     }
 
     // ── Host Has History warning ──
